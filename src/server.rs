@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use serde::Serialize;
+use serde_json;
+
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -12,6 +15,7 @@ pub struct Response {
     stream: TcpStream,
     status_code: u16,
     body: String,
+    headers: HashMap<String, String>,
 }
 
 impl Response {
@@ -20,11 +24,17 @@ impl Response {
             stream,
             status_code: 200,
             body: String::new(),
+            headers: HashMap::new(),
         }
     }
 
     pub fn status(&mut self, code: u16) -> &mut Self {
         self.status_code = code;
+        self
+    }
+
+    pub fn header(&mut self, key: &str, value: &str) -> &mut Self {
+        self.headers.insert(key.to_string(), value.to_string());
         self
     }
 
@@ -42,23 +52,40 @@ impl Response {
             _ => "Unknown",
         };
 
+        self.header("Content-Length", &self.body.len().to_string());
+
+        let mut headers_str = String::new();
+        for (key, value) in &self.headers {
+            headers_str.push_str(&format!("{}: {}\r\n", key, value));
+        }
+
         let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\n{}\
+            \r\n{}",
             self.status_code,
             status_text,
-            self.body.len(),
+            headers_str,
             self.body
         );
 
         let _ = self.stream.write_all(response.as_bytes());
     }
-}
 
-type Handler = fn(Request, Response);
+    pub fn json<T: Serialize>(&mut self, data: &T) {
+        if let Ok(json_str) = serde_json::to_string(data) {
+            self.header("Content-Type", "application/json");
+            self.send(&json_str);
+        } else {
+            self.status(500).send("{\"error\": \"Failed to serialize JSON\"}");
+        }
+    }
+}
 
 pub struct MiniExpress {
     routes: HashMap<String, Handler>,
 }
+
+type Handler = fn(Request, Response);
 
 impl MiniExpress {
     pub fn new() -> Self {
