@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json;
@@ -81,37 +82,65 @@ impl Response {
     }
 }
 
-pub struct MiniExpress {
-    routes: HashMap<String, Handler>,
+type Handler = fn(Request, Response, Option<HashMap<String, String>>);
+
+#[derive(Clone)]
+pub struct Route {
+    method: String,
+    path: String,
+    handler: Handler,
 }
 
-type Handler = fn(Request, Response);
+type Next<'a> = Box<dyn FnOnce(Request, Response, Option<HashMap<String, String>>) + Send + 'a>;
+type Middleware = Arc<dyn Fn(Request, Response, Option<HashMap<String, String>>, Next) + Send + Sync>;
+
+pub struct MiniExpress {
+    routes: Vec<Route>,
+    middlewares: Vec<Middleware>,
+}
 
 impl MiniExpress {
     pub fn new() -> Self {
         MiniExpress {
-            routes: HashMap::new(),
+            routes: Vec::new(),
+            middlewares: Vec::new(),
         }
     }
-
-    pub fn get(&mut self, path: &str, handler: Handler) {
-        self.routes.insert(format!("GET {}", path), handler);
+    
+    pub fn use_middleware(&mut self, mw: Middleware) {
+        self.middlewares.push(mw);
     }
-
+    
+    pub fn get(&mut self, path: &str, handler: Handler) {
+        self.routes.push(Route {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            handler,
+        });
+    }
+    
     pub fn post(&mut self, path: &str, handler: Handler) {
-        self.routes.insert(format!("POST {}", path), handler);
+        self.routes.push(Route {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            handler,
+        });
     }
 
     pub fn listen(&self, addr: &str) {
         let listener = TcpListener::bind(addr).unwrap();
         println!("Listening on {}", addr);
-
+    
+        let routes = self.routes.clone();
+        let middlewares = self.middlewares.clone();
+    
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let routes = self.routes.clone();
+                    let routes = routes.clone();
+                    let middlewares = middlewares.clone();
                     std::thread::spawn(move || {
-                        handle_connection(stream, routes);
+                        handle_connection(stream, routes, middlewares);
                     });
                 }
                 Err(e) => eprintln!("Connection failed: {}", e),
@@ -120,7 +149,65 @@ impl MiniExpress {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, routes: HashMap<String, Handler>) {
+fn match_route<'a>(
+    method: &str,
+    req_path: &str,
+    routes: &'a [Route],
+) -> Option<(&'a Handler, Option<HashMap<String, String>>)> {
+    for route in routes {
+        if route.method != method {
+            continue;
+        }
+
+        let route_parts: Vec<&str> = route.path.split('/').collect();
+        let req_parts: Vec<&str> = req_path.split('/').collect();
+
+        if route_parts.len() != req_parts.len() {
+            continue;
+        }
+
+        let mut params = HashMap::new();
+        let mut matched = true;
+
+        for (rp, rq) in route_parts.iter().zip(req_parts.iter()) {
+            if rp.starts_with(':') {
+                // parâmetro, extrai o nome sem ':'
+                params.insert(rp[1..].to_string(), rq.to_string());
+            } else if rp != rq {
+                matched = false;
+                break;
+            }
+        }
+
+        if matched {
+            if params.is_empty() {
+                return Some((&route.handler, None));
+            } else {
+                return Some((&route.handler, Some(params)));
+            }
+        }
+    }
+    None
+}
+
+fn run_middlewares<'a>(
+    req: Request,
+    res: Response,
+    params: Option<HashMap<String, String>>,
+    middlewares: &'a [Middleware],
+    handler: &'a Handler,
+) {
+    if let Some((first, rest)) = middlewares.split_first() {
+        let next = Box::new(move |req, res, params| {
+            run_middlewares(req, res, params, rest, handler);
+        });
+        first(req, res, params, next);
+    } else {
+        handler(req, res, params);
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, routes: Vec<Route>, middlewares: Vec<Middleware>) {
     let mut buffer = [0; 512];
     let _ = stream.read(&mut buffer);
 
@@ -137,8 +224,8 @@ fn handle_connection(mut stream: TcpStream, routes: HashMap<String, Handler>) {
             let req = Request { method: method.clone(), path: path.clone(), body };
             let res = Response::new(stream.try_clone().unwrap());
 
-            if let Some(handler) = routes.get(&format!("{} {}", method, path)) {
-                handler(req, res);
+            if let Some((handler, params)) = match_route(&method, &path, &routes) {
+                run_middlewares(req, res, params, &middlewares, handler);
             } else {
                 let mut res = Response::new(stream);
                 res.status(404).send("Not Found");
